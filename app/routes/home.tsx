@@ -378,6 +378,22 @@ export default function Home() {
               <span className="font-medium">Roboflow</span>
             </a>
           </div>
+          {/* Hidden file input */}
+          <input 
+            ref={fileInputRef}
+            type="file" 
+            accept="image/*" 
+            onChange={handleFileChange} 
+            style={{ display: 'none' }} 
+          />
+
+          {/* Upload Image Button */}
+          <button 
+            onClick={handleUploadClick} 
+            className="mt-4 px-4 py-2 bg-guinness-gold text-guinness-black rounded-md"
+          >
+            Upload Image
+          </button>
         </div>
       )}
 
