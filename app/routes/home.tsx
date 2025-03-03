@@ -1,6 +1,5 @@
-import { useEffect, useRef, useState, useMemo } from "react";
-import { useNavigate, useFetcher, useSubmit, useActionData, redirect } from "react-router";
-import Webcam from "react-webcam";
+import { useEffect, useRef, useState } from "react";
+import { useNavigate, useSubmit, useActionData, redirect } from "react-router";
 import { RoboflowLogo } from "../components/RoboflowLogo";
 import { PintGlassOverlay } from "../components/PintGlassOverlay";
 import type { ActionFunctionArgs } from "react-router";
@@ -23,6 +22,7 @@ export async function action({ request }: ActionFunctionArgs) {
   const formData = await request.formData();
   const base64Image = formData.get('image') as string;
   const username = generateBeerUsername();
+  const sessionId = crypto.randomUUID();
 
   try {
     const response = await fetch('https://detect.roboflow.com/infer/workflows/hunter-diminick/split-g-scoring', {
@@ -63,7 +63,7 @@ export async function action({ request }: ActionFunctionArgs) {
     const splitImageUrl = await uploadImage(splitImage, 'split-images');
     const pintImageUrl = await uploadImage(pintImage, 'pint-images');
 
-    // Create database record
+    // Create database record with session_id
     const { data: score, error: dbError } = await supabase
       .from('scores')
       .insert({
@@ -71,15 +71,22 @@ export async function action({ request }: ActionFunctionArgs) {
         split_image_url: splitImageUrl,
         pint_image_url: pintImageUrl,
         username: username,
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
+        session_id: sessionId
       })
       .select()
       .single();
 
     if (dbError) throw dbError;
 
+    // Set the session cookie before redirecting
+    const headers = new Headers();
+    headers.append('Set-Cookie', `split-g-session=${sessionId}; Path=/; Max-Age=31536000; SameSite=Lax`);
+
     // Redirect to the score page with the ID
-    return redirect(`/score/${score.id}`);
+    return redirect(`/score/${score.id}`, {
+      headers
+    });
 
   } catch (error) {
     console.error('Error processing image:', error);
@@ -97,11 +104,8 @@ export async function action({ request }: ActionFunctionArgs) {
 
 export default function Home() {
   const [isCameraActive, setIsCameraActive] = useState(false);
-  const [isCameraReady, setIsCameraReady] = useState(false);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
-  const webcamRef = useRef<Webcam>(null);
   const navigate = useNavigate();
-  const fetcher = useFetcher();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const submit = useSubmit();
@@ -114,7 +118,7 @@ export default function Home() {
     if (typeof window === 'undefined') return;
     
     async function initInference() {
-      const { InferenceEngine, CVImage } = await import('inferencejs');
+      const { InferenceEngine } = await import('inferencejs');
       setInferEngine(new InferenceEngine());
     }
     
@@ -130,7 +134,7 @@ export default function Home() {
     
     setModelLoading(true);
     inferEngine
-      .startWorker("split-g-label-experiment", "6", "rf_KknWyvJ8ONXATuszsdUEuknA86p2")
+      .startWorker("split-g-label-experiment", "8", "rf_KknWyvJ8ONXATuszsdUEuknA86p2")
       .then((id) => setModelWorkerId(id));
   }, [inferEngine, modelLoading]);
 
@@ -179,17 +183,13 @@ export default function Home() {
         const img = new CVImage(videoRef.current);
         const predictions = await inferEngine.infer(modelWorkerId, img);
         
-        const hasGlass = predictions.some(pred => 
-          pred.class === "glass"
-        );
-        const hasG = predictions.some(pred => 
-          pred.class === "G"
-        );
+        const hasGlass = predictions.some(pred => pred.class === "glass");
+        const hasG = predictions.some(pred => pred.class === "G");
 
         if (hasGlass && hasG) {
           setConsecutiveDetections(prev => prev + 1);
           
-          if (consecutiveDetections >= 6) {
+          if (consecutiveDetections >= 4) {
             setFeedbackMessage("Perfect! Processing your pour...");
             setIsProcessing(true);
             setIsSubmitting(true);
@@ -210,99 +210,79 @@ export default function Home() {
               stream?.getTracks().forEach(track => track.stop());
               setIsCameraActive(false);
 
-                            // Submit form data to action
-                            const formData = new FormData();
-                            formData.append('image', base64Image);
-                            
-                            submit(formData, {
-                              method: 'post',
-                              action: '/?index',
-                              encType: 'multipart/form-data',
-                            });
-                          }
-                          return; // Exit the detection loop
-                        }
-                        if (consecutiveDetections >= 3) {
-                          setFeedbackMessage("Hold still...");
-                        } else {
-                          setFeedbackMessage("Keep the glass centered...");
-                        }
-                      } else {
-                        setConsecutiveDetections(0);
-                        if (!hasGlass) {
-                          setFeedbackMessage("Show your pint glass");
-                        } else if (!hasG) {
-                          setFeedbackMessage("Make sure the G pattern is visible");
-                        }
-                      }
-                    } catch (error) {
-                      console.error('Detection error:', error);
-                    }
-                  };
+              // Submit form data to action
+              const formData = new FormData();
+              formData.append('image', base64Image);
+              
+              submit(formData, {
+                method: 'post',
+                action: '/?index',
+                encType: 'multipart/form-data',
+              });
+            }
+            return; // Exit the detection loop
+          }
+          if (consecutiveDetections >= 1) {
+            setFeedbackMessage("Hold still...");
+          } else {
+            setFeedbackMessage("Keep the glass centered...");
+          }
+        } else {
+          setConsecutiveDetections(0);
+          if (!hasGlass) {
+            setFeedbackMessage("Show your pint glass");
+          } else if (!hasG) {
+            setFeedbackMessage("Make sure the G pattern is visible");
+          }
+        }
+      } catch (error) {
+        console.error('Detection error:', error);
+      }
+    };
 
-                  const intervalId = setInterval(detectFrame, 500);
-                  return () => clearInterval(intervalId);
-                }, [modelWorkerId, isCameraActive, inferEngine, isVideoReady, consecutiveDetections, submit]);
-              
-                // Add effect to handle action response
-                useEffect(() => {
-                  if (actionData && 'success' in actionData) {
-                    setIsSubmitting(false);
-                    if (actionData.success) {
-                      navigate('/score', { 
-                        state: {
-                          splitScore: actionData.splitScore,
-                          visualizationImages: actionData.visualizationImages
-                        }
-                      });
-                    } else {
-                      console.error('Action failed:', actionData.error);
-                      setFeedbackMessage("Analysis failed. Please try again.");
-                      setIsCameraActive(false);
-                    }
-                  }
-                }, [actionData, navigate]);
-              
-                useEffect(() => {
-                  if (fetcher.data?.success) {
-                    // Store the image in sessionStorage
-                    if (videoRef.current && canvasRef.current) {
-                      const canvas = canvasRef.current;
-                      const imageData = canvas.toDataURL('image/jpeg');
-                      sessionStorage.setItem('captured-pour-image', imageData);
-                    }
-                    setIsCameraActive(false);
-                    navigate('/score');
-                  }
-                }, [fetcher.data, navigate]);
-              
-                useEffect(() => {
-                  if (isCameraActive) {
-                    setCapturedImage(null);
-                  }
-                }, [isCameraActive]);
-              
-                const videoConstraints = {
-                  facingMode: { ideal: "environment" },
-                  width: 720,
-                  height: 960,
-                };
-              
-                const handleCapture = async () => {
-                  if (webcamRef.current) {
-                    const imageSrc = webcamRef.current.getScreenshot();
-                    if (imageSrc) {
-                      setCapturedImage(imageSrc);
-                      
-                      const formData = new FormData();
-                      const base64Image = imageSrc.replace(/^data:image\/\w+;base64,/, '');
-                      formData.append('image', base64Image);
-                      formData.append('imageUrl', imageSrc);
-              
-                      fetcher.submit(formData, { method: 'post' });
-                    }
-                  }
-                };
+    const intervalId = setInterval(detectFrame, 500);
+    return () => clearInterval(intervalId);
+  }, [modelWorkerId, isCameraActive, inferEngine, isVideoReady, consecutiveDetections, submit]);
+
+  // Add effect to handle action response
+  useEffect(() => {
+    if (actionData && 'success' in actionData) {
+      setIsSubmitting(false);
+      if (actionData.success) {
+        navigate('/score', { 
+          state: {
+            splitScore: actionData.splitScore,
+            visualizationImages: actionData.visualizationImages
+          }
+        });
+      } else {
+        console.error('Action failed:', actionData.error);
+        setFeedbackMessage("Analysis failed. Please try again.");
+        setIsCameraActive(false);
+      }
+    }
+  }, [actionData, navigate]);
+
+  // Handle file input change
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64Image = reader.result?.toString().replace(/^data:image\/\w+;base64,/, '');
+      if (base64Image) {
+        const formData = new FormData();
+        formData.append('image', base64Image);
+        submit(formData, {
+          method: 'post',
+          action: '/?index',
+          encType: 'multipart/form-data',
+        });
+      }
+    };
+    reader.readAsDataURL(file);
+  };
 
   return (
     <main className="flex items-center justify-center min-h-screen bg-guinness-black text-guinness-cream">
@@ -318,22 +298,18 @@ export default function Home() {
             <h1 className="text-4xl md:text-5xl font-bold text-guinness-gold tracking-wide">
               Split the G
             </h1>
-            <div className="flex items-center gap-2 text-guinness-tan text-sm">
-              <span>Powered by</span>
-              <a 
-                href="https://roboflow.com" 
-                target="_blank" 
-                rel="noopener noreferrer"
-                className="flex items-center gap-1.5 text-guinness-gold hover:text-guinness-cream transition-colors duration-300"
-              >
-                <RoboflowLogo className="h-5 w-5" />
-                <span className="font-medium">Roboflow</span>
-              </a>
-            </div>
             <div className="w-32 h-0.5 bg-guinness-gold my-2"></div>
             <p className="text-lg md:text-xl text-guinness-tan font-light max-w-sm md:max-w-md mx-auto">
-              Put your Guinness splitting technique to the test! 
+              Put your Guinness splitting technique to the test!
             </p>
+            <a 
+              href="https://blog.roboflow.com/split-the-g-app/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm text-guinness-gold hover:text-guinness-cream transition-colors duration-300"
+            >
+              How we built this →
+            </a>
             <LeaderboardButton />
           </header>
 
@@ -364,8 +340,7 @@ export default function Home() {
                     className="absolute inset-0 w-full h-full object-cover"
                     autoPlay
                     playsInline
-                    onLoadedMetadata={() => setIsCameraReady(true)}
-                    onCanPlay={() => setIsVideoReady(true)}
+                    onLoadedMetadata={() => setIsVideoReady(true)}
                     onError={(err) => {
                       console.error('Camera error:', err);
                       setIsCameraActive(false);
@@ -380,54 +355,77 @@ export default function Home() {
                   </div>
                 </div>
               ) : (
-                <button
-                  onClick={() => setIsCameraActive(true)}
-                  className="w-full h-full flex flex-col items-center justify-center gap-4 text-guinness-gold hover:text-guinness-tan transition-colors duration-300"
-                >
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    className="h-16 md:h-20 w-16 md:w-20"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
+                <>
+                  <button
+                    onClick={() => setIsCameraActive(true)}
+                    className="w-full h-full flex flex-col items-center justify-center gap-4 text-guinness-gold hover:text-guinness-tan transition-colors duration-300"
                   >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"
-                    />
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"
-                    />
-                  </svg>
-                  <span className="text-lg md:text-xl font-medium">
-                    Start Analysis
-                  </span>
-                </button>
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      className="h-16 md:h-20 w-16 md:w-20"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"
+                      />
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"
+                      />
+                    </svg>
+                    <span className="text-lg md:text-xl font-medium">
+                      Start Analysis
+                    </span>
+                  </button>
+                </>
               )}
             </div>
           </div>
-        </div>
-      )}
 
-      {actionData?.success && (
-        <div className="mt-4 p-4 bg-green-100 rounded-lg">
-          <h3 className="text-xl font-bold mb-2">Score: {actionData.score}</h3>
-          <p className="text-sm text-gray-600">
-            {parseFloat(actionData.score) >= 3.75 
-              ? "Split G detected! 🎉" 
-              : "Keep trying for the perfect split! 🎯"}
-          </p>
-        </div>
-      )}
+          <button
+            onClick={() => document.getElementById('file-upload')?.click()}
+            className="w-3/4 mt-4 py-2 px-4 bg-guinness-gold text-guinness-black rounded-lg hover:bg-guinness-tan transition-colors duration-300"
+          >
+            Upload an Image
+          </button>
+          <input
+            id="file-upload"
+            type="file"
+            accept="image/*"
+            onChange={handleFileChange}
+            className="hidden"
+          />
 
-      {actionData?.error && (
-        <div className="mt-4 p-4 bg-red-100 rounded-lg">
-          <p className="text-red-600">{actionData.error}</p>
+          <div className="mt-8 text-guinness-tan text-sm">
+            <h2 className="text-lg font-bold">How to enter the Split-the-G contest:</h2>
+            <p>Follow the below steps before 11:59pm PST March 17, 2025.</p>
+            <ol className="list-decimal list-inside mt-2">
+              <li><strong>Receive a score</strong>: Hit the <strong>Start Analysis</strong> button on the website, aim your camera at the pint glass to capture an image, and let the website generate your score (the closer you are to the middle of the G logo, the better the score).</li>
+              <li><strong>Submit your score</strong>: Hit the <strong>Submit score</strong> button to submit your score to the leaderboard, fill out your contact information, and hit the <strong>Enter the contest</strong> button.</li>
+              <li><strong>All done!</strong></li>
+            </ol>
+
+            <h2 className="text-lg font-bold mt-4">Contest Rules:</h2>
+            <ul className="list-disc list-inside mt-2">
+              <li>Entry Period: Contest begins January 1, 2025 and ends 11:59pm PST March 17, 2025.</li>
+              <li>Prize: Commemorative item!</li>
+              <li>Winner Selection: The winner will be randomly selected from all eligible entries.</li>
+              <li>Eligibility: Must submit email to enter.</li>
+              <li>Winner Notification: The winner will be notified via the email provided upon submission within 10 business days of the contest end date.</li>
+              <li>No Purchase Necessary: Entering the contest does not require any purchase.</li>
+              <li>Multiple Entries: Multiple entries are allowed, but each entry must be submitted separately.</li>
+              <li>Disqualification: Any attempt to manipulate the contest or submit fraudulent entries will result in disqualification.</li>
+              <li>Privacy: Your email and personal information will be used solely for the purpose of this contest and will not be shared with third parties.</li>
+              <li>Acceptance of Rules: By entering the contest, you agree to abide by these rules and the decisions of the contest organizers.</li>
+            </ul>
+          </div>
         </div>
       )}
     </main>
